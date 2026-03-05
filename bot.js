@@ -226,7 +226,7 @@ bot.on("message", async (msg) => {
   if (s.step === "photo") {
     const photos = msg.photo;
     if (!photos || photos.length === 0) {
-      await bot.sendMessage(chatId, "Пожалуйста, отправьте именно фото.");
+      await bot.sendMessage(chatId, "Пожалуйста, отправьте именно фото весов.");
       return;
     }
 
