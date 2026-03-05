@@ -2,6 +2,12 @@
 // Node.js Telegram bot: анкета (согласие → ФИО → телефон → Telegram → фото),
 // сохранение данных в Google Sheets + сохранение фото на сервер (uploads/) и запись photo_url.
 //
+// UX-улучшения:
+// - ФИО проверяется: ровно 3 слова (Фамилия Имя Отчество)
+// - Telegram подтверждается кнопками (если у пользователя есть @username)
+// - Кнопки "🚀 Старт" и "🔄 Начать заново" (reply keyboard) — не нужно писать /start
+// - Inline-кнопка "🔄 Заполнить заново" после успешной регистрации
+//
 // Требования по .env:
 // BOT_TOKEN=...
 // SHEET_ID=...
@@ -48,13 +54,18 @@ if (!PUBLIC_BASE_URL) {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ---- ensure uploads dir exists ----
+const uploadsAbsPath = path.join(__dirname, UPLOAD_DIR);
+if (!fs.existsSync(uploadsAbsPath)) fs.mkdirSync(uploadsAbsPath, { recursive: true });
+
 // ---- Public file server for uploads ----
 const app = express();
-app.use("/uploads", express.static(path.join(__dirname, UPLOAD_DIR)));
+app.use("/uploads", express.static(uploadsAbsPath));
 app.get("/health", (req, res) => res.send("ok"));
 
 app.listen(PUBLIC_PORT, "0.0.0.0", () => {
   console.log(`Public server listening on port ${PUBLIC_PORT}`);
+  console.log(`Health check: ${PUBLIC_BASE_URL}/health`);
   console.log(`Uploads served at: ${PUBLIC_BASE_URL}/uploads/...`);
 });
 
@@ -67,14 +78,8 @@ const normalizePhone = (text) => {
   return t;
 };
 
-const normalizeTg = (text, suggested) => {
-  const t0 = String(text || "").trim();
-
-  if (suggested && ["да", "yes", "ok", "верно", "правильно"].includes(t0.toLowerCase())) {
-    return suggested;
-  }
-
-  let t = t0;
+const normalizeTg = (text) => {
+  let t = String(text || "").trim();
   if (t.includes("t.me/")) t = t.split("t.me/").pop();
   if (t.startsWith("@")) t = t.slice(1);
   if (!/^[A-Za-z0-9_]{5,32}$/.test(t)) return null;
@@ -101,6 +106,97 @@ function downloadToFile(url, destPath) {
   });
 }
 
+// ---- keyboards ----
+function mainMenuKeyboard() {
+  return {
+    keyboard: [[{ text: "🚀 Старт" }, { text: "🔄 Начать заново" }]],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+  };
+}
+
+function consentKeyboard(checked) {
+  if (checked) {
+    return {
+      inline_keyboard: [
+        [{ text: "☑️ Я согласен на обработку ПДн", callback_data: "consent_toggle" }],
+        [{ text: "✅ Продолжить", callback_data: "consent_continue" }],
+      ],
+    };
+  }
+  return {
+    inline_keyboard: [[{ text: "☐ Я согласен на обработку ПДн", callback_data: "consent_toggle" }]],
+  };
+}
+
+function telegramConfirmKeyboard(suggested) {
+  return {
+    inline_keyboard: [
+      [{ text: `✅ Да, это мой Telegram (${suggested})`, callback_data: "tg_confirm_yes" }],
+      [{ text: "✏️ Ввести другой", callback_data: "tg_confirm_other" }],
+    ],
+  };
+}
+
+function restartInlineKeyboard() {
+  return {
+    inline_keyboard: [[{ text: "🔄 Заполнить заново", callback_data: "restart_form" }]],
+  };
+}
+
+// ---- session helpers ----
+const sessions = new Map();
+/**
+ * session shape:
+ * {
+ *   step: "consent"|"full_name"|"phone"|"telegram"|"photo",
+ *   consent: boolean,
+ *   consent_at: string|null,
+ *   full_name: string,
+ *   phone: string,
+ *   telegram: string,
+ *   suggested_tg: string|null
+ * }
+ */
+function setSession(userId, patch) {
+  const prev = sessions.get(userId) || {};
+  sessions.set(userId, { ...prev, ...patch });
+}
+function getSession(userId) {
+  return sessions.get(userId);
+}
+
+async function beginForm(chatId, userId) {
+  // сброс
+  sessions.delete(userId);
+
+  setSession(userId, {
+    step: "consent",
+    consent: false,
+    consent_at: null,
+    full_name: "",
+    phone: "",
+    telegram: "",
+    suggested_tg: null,
+  });
+
+  // меню (reply keyboard)
+  await bot.sendMessage(chatId, "Выберите действие:", {
+    reply_markup: mainMenuKeyboard(),
+  });
+
+  const text =
+    "Привет! Заполните анкету участника.\n\n" +
+    `Перед началом ознакомьтесь с согласием на обработку персональных данных:\n${CONSENT_URL}\n\n` +
+    "Чтобы продолжить — поставьте галочку согласия.";
+
+  // inline keyboard (галочка) отдельным сообщением
+  await bot.sendMessage(chatId, text, {
+    reply_markup: consentKeyboard(false),
+    disable_web_page_preview: true,
+  });
+}
+
 // ---- Google Sheets init ----
 async function initSheet() {
   const credsRaw = fs.readFileSync(GOOGLE_CREDS, "utf8");
@@ -118,9 +214,7 @@ async function initSheet() {
 
   await doc.loadInfo();
   const sheet = doc.sheetsByIndex[0]; // первый лист
-
-  // важно для addRow(object)
-  await sheet.loadHeaderRow();
+  await sheet.loadHeaderRow(); // важно для addRow(object)
 
   console.log("Connected to spreadsheet:", doc.title);
   console.log("Using sheet:", sheet.title);
@@ -133,80 +227,19 @@ const sheetPromise = initSheet();
 // ---- Telegram bot init ----
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Состояние пользователей (в памяти). Для продакшна лучше Redis/DB.
-const sessions = new Map();
-/**
- * session shape:
- * {
- *   step: "consent"|"full_name"|"phone"|"telegram"|"photo",
- *   consent: boolean,
- *   consent_at: string|null,
- *   full_name: string,
- *   phone: string,
- *   telegram: string,
- *   suggested_tg: string|null
- * }
- */
-
-function setSession(userId, patch) {
-  const prev = sessions.get(userId) || {};
-  sessions.set(userId, { ...prev, ...patch });
-}
-
-function getSession(userId) {
-  return sessions.get(userId);
-}
-
-function consentKeyboard(checked) {
-  if (checked) {
-    return {
-      inline_keyboard: [
-        [{ text: "☑️ Я согласен на обработку ПДн", callback_data: "consent_toggle" }],
-        [{ text: "✅ Продолжить", callback_data: "consent_continue" }],
-      ],
-    };
-  }
-  return {
-    inline_keyboard: [[{ text: "☐ Я согласен на обработку ПДн", callback_data: "consent_toggle" }]],
-  };
-}
-
-// ---- /start ----
+// ---- /start and /reset ----
 bot.onText(/\/start/, async (msg) => {
-  const userId = msg.from.id;
-
-  // Всегда сбрасываем прошлую "незавершённую" анкету
-  sessions.delete(userId);
-
-  setSession(userId, {
-    step: "consent",
-    consent: false,
-    consent_at: null,
-    full_name: "",
-    phone: "",
-    telegram: "",
-    suggested_tg: null,
-  });
-
-  const text =
-    "Привет! Заполните анкету участника.\n\n" +
-    `Перед началом ознакомьтесь с согласием на обработку персональных данных:\n${CONSENT_URL}\n\n` +
-    "Чтобы продолжить — поставьте галочку согласия.";
-
-  await bot.sendMessage(msg.chat.id, text, {
-    reply_markup: consentKeyboard(false),
-    disable_web_page_preview: true,
-  });
+  await beginForm(msg.chat.id, msg.from.id);
 });
 
-// ---- /reset (на всякий случай) ----
 bot.onText(/\/reset/, async (msg) => {
-  const userId = msg.from.id;
-  sessions.delete(userId);
-  await bot.sendMessage(msg.chat.id, "Анкета сброшена. Напишите /start чтобы начать заново.");
+  sessions.delete(msg.from.id);
+  await bot.sendMessage(msg.chat.id, "Анкета сброшена. Нажмите «🚀 Старт» или напишите /start.", {
+    reply_markup: mainMenuKeyboard(),
+  });
 });
 
-// ---- inline callbacks (галочка/продолжить) ----
+// ---- inline callbacks (consent / telegram confirm / restart) ----
 bot.on("callback_query", async (q) => {
   const userId = q.from.id;
   const chatId = q.message.chat.id;
@@ -214,10 +247,11 @@ bot.on("callback_query", async (q) => {
 
   const s = getSession(userId);
   if (!s) {
-    await bot.answerCallbackQuery(q.id, { text: "Нажмите /start" });
+    await bot.answerCallbackQuery(q.id, { text: "Нажмите /start или кнопку «🚀 Старт»" });
     return;
   }
 
+  // согласие
   if (q.data === "consent_toggle") {
     const newValue = !s.consent;
     setSession(userId, { consent: newValue, consent_at: newValue ? nowIso() : null });
@@ -238,32 +272,75 @@ bot.on("callback_query", async (q) => {
     }
 
     setSession(userId, { step: "full_name" });
-    await bot.sendMessage(chatId, "Введите ФИО (например: Иванов Иван Иванович):");
+    await bot.sendMessage(chatId, "Введите ФИО в формате: Фамилия Имя Отчество (3 слова).\nПример: Иванов Иван Иванович");
     await bot.answerCallbackQuery(q.id);
+    return;
+  }
+
+  // подтверждение Telegram
+  if (q.data === "tg_confirm_yes") {
+    if (!s.suggested_tg) {
+      setSession(userId, { step: "telegram" });
+      await bot.sendMessage(chatId, "Не удалось определить username. Введите Telegram вручную: @username или t.me/username");
+      await bot.answerCallbackQuery(q.id, { text: "Введите вручную" });
+      return;
+    }
+
+    setSession(userId, { telegram: s.suggested_tg, step: "photo" });
+    await bot.sendMessage(chatId, "Отправьте вашу фотографию (как фото, не как файл):");
+    await bot.answerCallbackQuery(q.id, { text: "Telegram подтверждён" });
+    return;
+  }
+
+  if (q.data === "tg_confirm_other") {
+    setSession(userId, { step: "telegram" });
+    await bot.sendMessage(chatId, "Ок! Введите Telegram username в формате @username (или ссылку t.me/username):");
+    await bot.answerCallbackQuery(q.id);
+    return;
+  }
+
+  // заполнить заново
+  if (q.data === "restart_form") {
+    await bot.answerCallbackQuery(q.id);
+    await beginForm(chatId, userId);
     return;
   }
 
   await bot.answerCallbackQuery(q.id);
 });
 
-// ---- messages (шаги анкеты) ----
+// ---- messages (шаги анкеты + кнопки меню) ----
 bot.on("message", async (msg) => {
   // игнорируем команды
   if (msg.text && msg.text.startsWith("/")) return;
 
   const userId = msg.from.id;
   const chatId = msg.chat.id;
+  const txt = (msg.text || "").trim();
+
+  // кнопки меню (reply keyboard)
+  if (txt === "🚀 Старт" || txt === "🔄 Начать заново") {
+    await beginForm(chatId, userId);
+    return;
+  }
 
   const s = getSession(userId);
-  if (!s) return; // пользователь не делал /start
+  if (!s) return; // пользователь не начинал
 
-  // шаг: full_name
+  // шаг: full_name (ровно 3 слова)
   if (s.step === "full_name") {
-    const fullName = String(msg.text || "").trim();
-    if (fullName.length < 5) {
-      await bot.sendMessage(chatId, "ФИО слишком короткое. Введите полностью, пожалуйста.");
+    const fullNameRaw = String(msg.text || "").trim();
+    const parts = fullNameRaw.split(/\s+/).filter(Boolean);
+
+    if (parts.length !== 3) {
+      await bot.sendMessage(
+        chatId,
+        "Пожалуйста, введите ФИО в формате: Фамилия Имя Отчество (3 слова).\nПример: Иванов Иван Иванович"
+      );
       return;
     }
+
+    const fullName = parts.join(" ");
     setSession(userId, { full_name: fullName, step: "phone" });
     await bot.sendMessage(chatId, "Введите телефон в формате +79991234567 (или 79991234567):");
     return;
@@ -285,19 +362,18 @@ bot.on("message", async (msg) => {
     });
 
     if (username) {
-      await bot.sendMessage(
-        chatId,
-        `Ваш Telegram: ${username}\nЕсли верно — отправьте "да". Если нужно другой — отправьте @username или t.me/username`
-      );
+      await bot.sendMessage(chatId, `Я нашёл ваш Telegram: ${username}\nПодтвердите, пожалуйста:`, {
+        reply_markup: telegramConfirmKeyboard(username),
+      });
     } else {
       await bot.sendMessage(chatId, "Введите ваш Telegram username в формате @username (или ссылку t.me/username):");
     }
     return;
   }
 
-  // шаг: telegram
+  // шаг: telegram (ручной ввод)
   if (s.step === "telegram") {
-    const tg = normalizeTg(msg.text, s.suggested_tg);
+    const tg = normalizeTg(msg.text);
     if (!tg) {
       await bot.sendMessage(chatId, "Не удалось распознать username. Пример: @username или t.me/username");
       return;
@@ -316,33 +392,29 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // самое большое фото — последнее
     const biggest = photos[photos.length - 1];
     const photoFileId = biggest.file_id;
 
     try {
-      // 1) получить file_path
+      // 1) file_path
       const fileInfo = await bot.getFile(photoFileId);
       const filePath = fileInfo.file_path; // e.g. photos/file_123.jpg
 
-      // 2) url скачивания из Telegram
+      // 2) Telegram download url
       const tgDownloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
 
-      // 3) подготовить имя файла на сервере
+      // 3) filename on server
       const ext = path.extname(filePath) || ".jpg";
       const fileName = safeFileName(`${userId}_${Date.now()}${ext}`);
 
-      // 4) сохранить в uploads/
-      const saveDir = path.join(__dirname, UPLOAD_DIR);
-      if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
-
-      const localPath = path.join(saveDir, fileName);
+      // 4) save to uploads/
+      const localPath = path.join(uploadsAbsPath, fileName);
       await downloadToFile(tgDownloadUrl, localPath);
 
-      // 5) публичный URL для таблицы
+      // 5) public url
       const photoUrl = `${PUBLIC_BASE_URL}/uploads/${encodeURIComponent(fileName)}`;
 
-      // 6) запись в таблицу
+      // 6) write to Google Sheet
       const sheet = await sheetPromise;
 
       const row = {
@@ -364,7 +436,10 @@ bot.on("message", async (msg) => {
         "✅ Регистрация завершена!\n\n" +
           "Вы зарегистрированы как участник.\n\n" +
           "📞 В ближайшее время с вами свяжется организатор.\n" +
-          "Пожалуйста, ожидайте сообщения."
+          "Пожалуйста, ожидайте сообщения.",
+        {
+          reply_markup: restartInlineKeyboard(),
+        }
       );
 
       sessions.delete(userId);
