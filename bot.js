@@ -2,6 +2,7 @@ import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 import fs from "fs";
 import { GoogleSpreadsheet } from "google-spreadsheet";
+import { JWT } from "google-auth-library";
 
 dotenv.config();
 
@@ -42,15 +43,25 @@ async function initSheet() {
   const credsRaw = fs.readFileSync(GOOGLE_CREDS, "utf8");
   const creds = JSON.parse(credsRaw);
 
-  const doc = new GoogleSpreadsheet(SHEET_ID);
+  const SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+  ];
 
-  await doc.useServiceAccountAuth({
-    client_email: creds.client_email,
-    private_key: creds.private_key,
+  const jwt = new JWT({
+    email: creds.client_email,
+    key: creds.private_key,
+    scopes: SCOPES,
   });
 
+  // ВАЖНО: jwt передаём вторым аргументом
+  const doc = new GoogleSpreadsheet(SHEET_ID, jwt);
+
   await doc.loadInfo();
-  const sheet = doc.sheetsByIndex[0]; // первый лист
+  const sheet = doc.sheetsByIndex[0];
+
+  // Рекомендую подгрузить заголовки, чтобы addRow(object) работал стабильно
+  await sheet.loadHeaderRow();
+
   return sheet;
 }
 
@@ -250,7 +261,13 @@ bot.on("message", async (msg) => {
 
     await sheet.addRow(row);
 
-    await bot.sendMessage(chatId, "✅ Спасибо! Анкета заполнена и сохранена.");
+    await bot.sendMessage(
+      chatId,
+      "✅ Регистрация завершена!\n\n" +
+      "Вы зарегистрированы как участник.\n\n" +
+      "📞 В ближайшее время с вами свяжется организатор.\n" +
+      "Пожалуйста, ожидайте сообщения."
+    );
     sessions.delete(userId);
     return;
   }
