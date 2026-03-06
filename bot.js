@@ -109,6 +109,12 @@ function restartInlineKeyboard() {
   };
 }
 
+function statsContinueInlineKeyboard() {
+  return {
+    inline_keyboard: [[{ text: "▶️ Продолжить", callback_data: "stats_continue" }]],
+  };
+}
+
 function mainCategoryKeyboard() {
   return {
     inline_keyboard: [
@@ -319,14 +325,28 @@ async function getCategorySheet(mainCategory) {
   return sheet;
 }
 
-async function countRowsInSheet(sheet) {
+async function collectSheetStats(sheet) {
   const pageSize = 500;
   let offset = 0;
   let total = 0;
+  const breakdown = new Map();
 
   while (true) {
     const rows = await sheet.getRows({ offset, limit: pageSize });
-    total += rows.length;
+    for (const row of rows) {
+      total += 1;
+
+      let categoryPath = "";
+      if (typeof row.get === "function") {
+        categoryPath = row.get("category_path");
+      }
+      if (!categoryPath && row.category_path) {
+        categoryPath = row.category_path;
+      }
+
+      const normalizedPath = String(categoryPath || "").trim() || "Без категории";
+      breakdown.set(normalizedPath, (breakdown.get(normalizedPath) || 0) + 1);
+    }
 
     if (rows.length < pageSize) {
       break;
@@ -334,7 +354,12 @@ async function countRowsInSheet(sheet) {
     offset += pageSize;
   }
 
-  return total;
+  const sortedBreakdown = [...breakdown.entries()].sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0].localeCompare(b[0], "ru");
+  });
+
+  return { total, breakdown: sortedBreakdown };
 }
 
 async function buildStats() {
@@ -347,9 +372,9 @@ async function buildStats() {
 
   for (const [key, sheetTitle] of categories) {
     const sheet = doc.sheetsByTitle[sheetTitle];
-    const count = sheet ? await countRowsInSheet(sheet) : 0;
-    counts[key] = count;
-    total += count;
+    const sheetStats = sheet ? await collectSheetStats(sheet) : { total: 0, breakdown: [] };
+    counts[key] = sheetStats;
+    total += sheetStats.total;
   }
 
   return {
@@ -367,14 +392,32 @@ async function handleStatsRequest(chatId, userId) {
 
   try {
     const { counts, total } = await buildStats();
+    const details = ["верх", "тело", "низ"]
+      .map((category) => {
+        const catStats = counts[category] || { total: 0, breakdown: [] };
+        const title = category[0].toUpperCase() + category.slice(1);
+        const lines = [`${title}: ${catStats.total}`];
+
+        for (const [path, count] of catStats.breakdown) {
+          lines.push(`- ${path}: ${count}`);
+        }
+
+        if (catStats.breakdown.length === 0) {
+          lines.push("- нет данных");
+        }
+
+        return lines.join("\n");
+      })
+      .join("\n\n");
+
     const text =
       "📊 Статистика гардероба\n\n" +
-      `Верх: ${counts.верх || 0}\n` +
-      `Тело: ${counts.тело || 0}\n` +
-      `Низ: ${counts.низ || 0}\n\n` +
+      `${details}\n\n` +
       `Итого: ${total}`;
 
-    await bot.sendMessage(chatId, text);
+    await bot.sendMessage(chatId, text, {
+      reply_markup: statsContinueInlineKeyboard(),
+    });
   } catch (err) {
     console.error("STATS ERROR:", err);
     await bot.sendMessage(chatId, "❌ Не удалось получить статистику. Попробуйте позже.");
@@ -465,6 +508,13 @@ bot.on("callback_query", async (q) => {
     if (data === "restart_form") {
       resetItemState(userId);
       await bot.sendMessage(chatId, "Отправьте следующую вещь (как фото, не как файл):");
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "stats_continue") {
+      resetItemState(userId);
+      await bot.sendMessage(chatId, "Продолжаем. Отправьте фото вещи (как фото, не как файл):");
       await bot.answerCallbackQuery(q.id);
       return;
     }
