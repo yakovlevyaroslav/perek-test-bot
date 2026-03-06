@@ -100,9 +100,14 @@ const MAIN_CATEGORY_TO_SHEET = {
 };
 
 // ---- keyboards ----
-function mainMenuKeyboard() {
+function mainMenuKeyboard(userId) {
+  const row = [{ text: "🚀 Старт" }, { text: "🔄 Начать заново" }];
+  if (isAdmin(userId)) {
+    row.push({ text: "📊 Статистика" });
+  }
+
   return {
-    keyboard: [[{ text: "🚀 Старт" }, { text: "🔄 Начать заново" }]],
+    keyboard: [row],
     resize_keyboard: true,
     one_time_keyboard: false,
   };
@@ -260,7 +265,7 @@ async function beginFlow(chatId, userId) {
   });
 
   await bot.sendMessage(chatId, "Выберите действие:", {
-    reply_markup: mainMenuKeyboard(),
+    reply_markup: mainMenuKeyboard(userId),
   });
   await bot.sendMessage(chatId, "Введите пароль для доступа к персональному гардеробу:");
 }
@@ -363,10 +368,38 @@ async function buildStats() {
   };
 }
 
+async function handleStatsRequest(chatId, userId) {
+  if (ADMIN_USER_IDS.size === 0) {
+    await bot.sendMessage(chatId, "Команда /stats не настроена. Добавьте ADMIN_USER_IDS в .env.");
+    return;
+  }
+
+  if (!isAdmin(userId)) {
+    await bot.sendMessage(chatId, "⛔️ У вас нет доступа к админ-статистике.");
+    return;
+  }
+
+  try {
+    const { counts, total } = await buildStats();
+    const text =
+      "📊 Статистика гардероба\n\n" +
+      `Верх: ${counts.верх || 0}\n` +
+      `Тело: ${counts.тело || 0}\n` +
+      `Низ: ${counts.низ || 0}\n\n` +
+      `Итого: ${total}`;
+
+    await bot.sendMessage(chatId, text);
+  } catch (err) {
+    console.error("STATS ERROR:", err);
+    await bot.sendMessage(chatId, "❌ Не удалось получить статистику. Попробуйте позже.");
+  }
+}
+
 async function saveWardrobeItem(userId, session) {
   const sheet = await getCategorySheet(session.main_category);
   const [sub1 = "", sub2 = "", sub3 = "", sub4 = ""] = session.sub_categories || [];
   const categoryPath = [session.main_category, ...session.sub_categories].filter(Boolean).join(" > ");
+  const photoFormula = `=IMAGE("${session.photo_url}")`;
 
   await sheet.addRow({
     created_at: nowIso(),
@@ -378,7 +411,7 @@ async function saveWardrobeItem(userId, session) {
     sub_category_4: sub4,
     category_path: categoryPath,
     photo_file_id: session.photo_file_id,
-    photo_url: session.photo_url,
+    photo_url: photoFormula,
   });
 }
 
@@ -417,38 +450,12 @@ bot.onText(/\/start/, async (msg) => {
 bot.onText(/\/reset/, async (msg) => {
   sessions.delete(msg.from.id);
   await bot.sendMessage(msg.chat.id, "Сессия сброшена. Нажмите «🚀 Старт» или напишите /start.", {
-    reply_markup: mainMenuKeyboard(),
+    reply_markup: mainMenuKeyboard(msg.from.id),
   });
 });
 
 bot.onText(/^\/stats(?:@\w+)?$/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (ADMIN_USER_IDS.size === 0) {
-    await bot.sendMessage(chatId, "Команда /stats не настроена. Добавьте ADMIN_USER_IDS в .env.");
-    return;
-  }
-
-  if (!isAdmin(userId)) {
-    await bot.sendMessage(chatId, "⛔️ У вас нет доступа к админ-статистике.");
-    return;
-  }
-
-  try {
-    const { counts, total } = await buildStats();
-    const text =
-      "📊 Статистика гардероба\n\n" +
-      `Верх: ${counts.верх || 0}\n` +
-      `Тело: ${counts.тело || 0}\n` +
-      `Низ: ${counts.низ || 0}\n\n` +
-      `Итого: ${total}`;
-
-    await bot.sendMessage(chatId, text);
-  } catch (err) {
-    console.error("STATS ERROR:", err);
-    await bot.sendMessage(chatId, "❌ Не удалось получить статистику. Попробуйте позже.");
-  }
+  await handleStatsRequest(msg.chat.id, msg.from.id);
 });
 
 // ---- inline callbacks ----
@@ -675,6 +682,10 @@ bot.on("message", async (msg) => {
 
   if (txt === "🚀 Старт" || txt === "🔄 Начать заново") {
     await beginFlow(chatId, userId);
+    return;
+  }
+  if (txt === "📊 Статистика") {
+    await handleStatsRequest(chatId, userId);
     return;
   }
 
