@@ -1,25 +1,3 @@
-// bot.js
-// Node.js Telegram bot: анкета (согласие → ФИО → телефон → Telegram → фото),
-// сохранение данных в Google Sheets + сохранение фото на сервер (uploads/) и запись photo_url.
-//
-// UX-улучшения:
-// - ФИО проверяется: ровно 3 слова (Фамилия Имя Отчество)
-// - Telegram подтверждается кнопками (если у пользователя есть @username)
-// - Кнопки "🚀 Старт" и "🔄 Начать заново" (reply keyboard) — не нужно писать /start
-// - Inline-кнопка "🔄 Заполнить заново" после успешной регистрации
-//
-// Требования по .env:
-// BOT_TOKEN=...
-// SHEET_ID=...
-// CONSENT_URL=...
-// GOOGLE_CREDS=service_account.json
-// PUBLIC_BASE_URL=http://SERVER_IP:3000   (или https://your-domain)
-// PUBLIC_PORT=3000
-// UPLOAD_DIR=uploads
-//
-// В Google Sheets (первая строка) должны быть заголовки колонок:
-// created_at,user_id,full_name,phone,telegram,consent,consent_at,photo_file_id,photo_url
-
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 import fs from "fs";
@@ -36,15 +14,21 @@ dotenv.config();
 // ---- env ----
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SHEET_ID = process.env.SHEET_ID;
-const CONSENT_URL = process.env.CONSENT_URL;
 const GOOGLE_CREDS = process.env.GOOGLE_CREDS || "service_account.json";
+const ACCESS_PASSWORD = process.env.BOT_PASSWORD || "shkaf2026";
+const ADMIN_USER_IDS = new Set(
+  String(process.env.ADMIN_USER_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // например http://185.21.12.44:3000 или https://example.com
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 3000);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "uploads";
 
-if (!BOT_TOKEN || !SHEET_ID || !CONSENT_URL) {
-  throw new Error("Заполните .env: BOT_TOKEN, SHEET_ID, CONSENT_URL");
+if (!BOT_TOKEN || !SHEET_ID) {
+  throw new Error("Заполните .env: BOT_TOKEN, SHEET_ID");
 }
 if (!PUBLIC_BASE_URL) {
   throw new Error("Заполните .env: PUBLIC_BASE_URL (например http://SERVER_IP:3000 или https://example.com)");
@@ -72,22 +56,12 @@ app.listen(PUBLIC_PORT, "0.0.0.0", () => {
 // ---- helpers ----
 const nowIso = () => new Date().toISOString();
 
-const normalizePhone = (text) => {
-  const t = String(text || "").trim().replace(/\s+/g, "").replace(/-/g, "");
-  if (!/^\+?\d{10,15}$/.test(t)) return null;
-  return t;
-};
-
-const normalizeTg = (text) => {
-  let t = String(text || "").trim();
-  if (t.includes("t.me/")) t = t.split("t.me/").pop();
-  if (t.startsWith("@")) t = t.slice(1);
-  if (!/^[A-Za-z0-9_]{5,32}$/.test(t)) return null;
-  return `@${t}`;
-};
-
 function safeFileName(s) {
   return String(s).replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function isAdmin(userId) {
+  return ADMIN_USER_IDS.has(String(userId));
 }
 
 function downloadToFile(url, destPath) {
@@ -106,6 +80,25 @@ function downloadToFile(url, destPath) {
   });
 }
 
+const SHEET_HEADERS = [
+  "created_at",
+  "user_id",
+  "main_category",
+  "sub_category_1",
+  "sub_category_2",
+  "sub_category_3",
+  "sub_category_4",
+  "category_path",
+  "photo_file_id",
+  "photo_url",
+];
+
+const MAIN_CATEGORY_TO_SHEET = {
+  верх: "верх",
+  тело: "тело",
+  низ: "низ",
+};
+
 // ---- keyboards ----
 function mainMenuKeyboard() {
   return {
@@ -115,32 +108,110 @@ function mainMenuKeyboard() {
   };
 }
 
-function consentKeyboard(checked) {
-  if (checked) {
-    return {
-      inline_keyboard: [
-        [{ text: "☑️ Я согласен на обработку ПДн", callback_data: "consent_toggle" }],
-        [{ text: "✅ Продолжить", callback_data: "consent_continue" }],
-      ],
-    };
-  }
+function restartInlineKeyboard() {
   return {
-    inline_keyboard: [[{ text: "☐ Я согласен на обработку ПДн", callback_data: "consent_toggle" }]],
+    inline_keyboard: [[{ text: "➕ Добавить еще вещь", callback_data: "restart_form" }]],
   };
 }
 
-function telegramConfirmKeyboard(suggested) {
+function mainCategoryKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: `✅ Да, это мой Telegram (${suggested})`, callback_data: "tg_confirm_yes" }],
-      [{ text: "✏️ Ввести другой", callback_data: "tg_confirm_other" }],
+      [{ text: "Верх", callback_data: "cat_main_upper" }],
+      [{ text: "Тело", callback_data: "cat_main_body" }],
+      [{ text: "Низ", callback_data: "cat_main_lower" }],
     ],
   };
 }
 
-function restartInlineKeyboard() {
+function upperSeasonKeyboard() {
   return {
-    inline_keyboard: [[{ text: "🔄 Заполнить заново", callback_data: "restart_form" }]],
+    inline_keyboard: [
+      [{ text: "Летний головной убор", callback_data: "cat_upper_summer" }],
+      [{ text: "Зимний головной убор", callback_data: "cat_upper_winter" }],
+      [{ text: "Осенне-весенний головной убор", callback_data: "cat_upper_midseason" }],
+    ],
+  };
+}
+
+function bodyWarmthKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Легкая вещь", callback_data: "cat_body_light" }],
+      [{ text: "Теплая вещь", callback_data: "cat_body_warm" }],
+    ],
+  };
+}
+
+function bodyLightTypeKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Футболка", callback_data: "cat_body_light_tshirt" }],
+      [{ text: "Кофта", callback_data: "cat_body_light_sweater" }],
+      [{ text: "Рубашка", callback_data: "cat_body_light_shirt" }],
+      [{ text: "Легкая куртка", callback_data: "cat_body_light_jacket" }],
+    ],
+  };
+}
+
+function bodyWarmTypeKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Куртка зимняя", callback_data: "cat_body_warm_winter_jacket" }],
+      [{ text: "Куртка легкая", callback_data: "cat_body_warm_light_jacket" }],
+      [{ text: "Теплая кофта", callback_data: "cat_body_warm_sweater" }],
+    ],
+  };
+}
+
+function lowerTypeKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Штаны", callback_data: "cat_lower_pants" }],
+      [{ text: "Обувь", callback_data: "cat_lower_shoes" }],
+    ],
+  };
+}
+
+function pantsLengthKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Короткие штаны", callback_data: "cat_pants_short" }],
+      [{ text: "Длинные штаны", callback_data: "cat_pants_long" }],
+    ],
+  };
+}
+
+function shortPantsTypeKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Шорты для спорта", callback_data: "cat_pants_short_sport" }],
+      [{ text: "Шорты для плавания", callback_data: "cat_pants_short_swim" }],
+      [{ text: "Шорты для прогулок", callback_data: "cat_pants_short_walk" }],
+    ],
+  };
+}
+
+function longPantsTypeKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Штаны для спорта", callback_data: "cat_pants_long_sport" }],
+      [{ text: "Джинсы", callback_data: "cat_pants_long_jeans" }],
+      [{ text: "Штаны для прогулок", callback_data: "cat_pants_long_walk" }],
+      [{ text: "Теплые штаны", callback_data: "cat_pants_long_warm" }],
+    ],
+  };
+}
+
+function shoesTypeKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Зимняя обувь", callback_data: "cat_shoes_winter" }],
+      [{ text: "Спортивная обувь", callback_data: "cat_shoes_sport" }],
+      [{ text: "Легкая обувь", callback_data: "cat_shoes_light" }],
+      [{ text: "Кроксы", callback_data: "cat_shoes_crocs" }],
+      [{ text: "Тапочки", callback_data: "cat_shoes_slippers" }],
+    ],
   };
 }
 
@@ -149,101 +220,242 @@ const sessions = new Map();
 /**
  * session shape:
  * {
- *   step: "consent"|"full_name"|"phone"|"telegram"|"photo",
- *   consent: boolean,
- *   consent_at: string|null,
- *   full_name: string,
- *   phone: string,
- *   telegram: string,
- *   suggested_tg: string|null
+ *   step: "password"|"photo"|"main_category"|"upper_season"|"body_warmth"|"body_light_type"|"body_warm_type"|
+ *         "lower_type"|"pants_length"|"pants_short_type"|"pants_long_type"|"shoes_type",
+ *   authenticated: boolean,
+ *   photo_file_id: string,
+ *   photo_url: string,
+ *   main_category: "верх"|"тело"|"низ"|"",
+ *   sub_categories: string[]
  * }
  */
 function setSession(userId, patch) {
   const prev = sessions.get(userId) || {};
   sessions.set(userId, { ...prev, ...patch });
 }
+
 function getSession(userId) {
   return sessions.get(userId);
 }
 
-async function beginForm(chatId, userId) {
-  // сброс
-  sessions.delete(userId);
-
+function resetItemState(userId) {
   setSession(userId, {
-    step: "consent",
-    consent: false,
-    consent_at: null,
-    full_name: "",
-    phone: "",
-    telegram: "",
-    suggested_tg: null,
+    step: "photo",
+    photo_file_id: "",
+    photo_url: "",
+    main_category: "",
+    sub_categories: [],
+  });
+}
+
+async function beginFlow(chatId, userId) {
+  sessions.delete(userId);
+  setSession(userId, {
+    step: "password",
+    authenticated: false,
+    photo_file_id: "",
+    photo_url: "",
+    main_category: "",
+    sub_categories: [],
   });
 
-  // меню (reply keyboard)
   await bot.sendMessage(chatId, "Выберите действие:", {
     reply_markup: mainMenuKeyboard(),
   });
+  await bot.sendMessage(chatId, "Введите пароль для доступа к персональному гардеробу:");
+}
 
-  const text =
-    "Привет! Заполните анкету участника.\n\n" +
-    `Перед началом ознакомьтесь с согласием на обработку персональных данных:\n${CONSENT_URL}\n\n` +
-    "Чтобы продолжить — поставьте галочку согласия.";
-
-  // inline keyboard (галочка) отдельным сообщением
-  await bot.sendMessage(chatId, text, {
-    reply_markup: consentKeyboard(false),
-    disable_web_page_preview: true,
+async function askForMainCategory(chatId) {
+  await bot.sendMessage(chatId, "Выберите основную категорию вещи:", {
+    reply_markup: mainCategoryKeyboard(),
   });
 }
 
 // ---- Google Sheets init ----
-async function initSheet() {
+async function initDoc() {
   const credsRaw = fs.readFileSync(GOOGLE_CREDS, "utf8");
   const creds = JSON.parse(credsRaw);
-
-  const SCOPES = ["https://www.googleapis.com/auth/spreadsheets"];
+  const scopes = ["https://www.googleapis.com/auth/spreadsheets"];
 
   const jwt = new JWT({
     email: creds.client_email,
     key: creds.private_key,
-    scopes: SCOPES,
+    scopes,
   });
 
   const doc = new GoogleSpreadsheet(SHEET_ID, jwt);
-
   await doc.loadInfo();
-  const sheet = doc.sheetsByIndex[0]; // первый лист
-  await sheet.loadHeaderRow(); // важно для addRow(object)
 
   console.log("Connected to spreadsheet:", doc.title);
-  console.log("Using sheet:", sheet.title);
+  return doc;
+}
+
+async function ensureSheetHeaders(sheet) {
+  try {
+    await sheet.loadHeaderRow();
+  } catch {
+    await sheet.setHeaderRow(SHEET_HEADERS);
+    return;
+  }
+
+  const existing = sheet.headerValues || [];
+  const hasAllHeaders = SHEET_HEADERS.every((h) => existing.includes(h));
+  if (!hasAllHeaders) {
+    await sheet.setHeaderRow(SHEET_HEADERS);
+  }
+}
+
+async function getCategorySheet(mainCategory) {
+  const title = MAIN_CATEGORY_TO_SHEET[mainCategory];
+  if (!title) {
+    throw new Error(`Unknown main category: ${mainCategory}`);
+  }
+
+  const doc = await docPromise;
+  await doc.loadInfo();
+
+  let sheet = doc.sheetsByTitle[title];
+  if (!sheet) {
+    sheet = await doc.addSheet({ title, headerValues: SHEET_HEADERS });
+  } else {
+    await ensureSheetHeaders(sheet);
+  }
 
   return sheet;
 }
 
-const sheetPromise = initSheet();
+async function countRowsInSheet(sheet) {
+  const pageSize = 500;
+  let offset = 0;
+  let total = 0;
+
+  while (true) {
+    const rows = await sheet.getRows({ offset, limit: pageSize });
+    total += rows.length;
+
+    if (rows.length < pageSize) {
+      break;
+    }
+    offset += pageSize;
+  }
+
+  return total;
+}
+
+async function buildStats() {
+  const doc = await docPromise;
+  await doc.loadInfo();
+
+  const categories = Object.entries(MAIN_CATEGORY_TO_SHEET);
+  const counts = {};
+  let total = 0;
+
+  for (const [key, sheetTitle] of categories) {
+    const sheet = doc.sheetsByTitle[sheetTitle];
+    const count = sheet ? await countRowsInSheet(sheet) : 0;
+    counts[key] = count;
+    total += count;
+  }
+
+  return {
+    counts,
+    total,
+  };
+}
+
+async function saveWardrobeItem(userId, session) {
+  const sheet = await getCategorySheet(session.main_category);
+  const [sub1 = "", sub2 = "", sub3 = "", sub4 = ""] = session.sub_categories || [];
+  const categoryPath = [session.main_category, ...session.sub_categories].filter(Boolean).join(" > ");
+
+  await sheet.addRow({
+    created_at: nowIso(),
+    user_id: String(userId),
+    main_category: session.main_category,
+    sub_category_1: sub1,
+    sub_category_2: sub2,
+    sub_category_3: sub3,
+    sub_category_4: sub4,
+    category_path: categoryPath,
+    photo_file_id: session.photo_file_id,
+    photo_url: session.photo_url,
+  });
+}
+
+async function finalizeCategory(chatId, userId, mainCategory, subCategories) {
+  const session = getSession(userId);
+  if (!session || !session.photo_file_id || !session.photo_url) {
+    await bot.sendMessage(chatId, "Сначала отправьте фото вещи.");
+    return;
+  }
+
+  setSession(userId, { main_category: mainCategory, sub_categories: subCategories });
+  const updated = getSession(userId);
+  const categoryPath = [mainCategory, ...subCategories].join(" > ");
+
+  await saveWardrobeItem(userId, updated);
+
+  await bot.sendMessage(
+    chatId,
+    `✅ Вещь сохранена.\n\nКатегория: ${categoryPath}\nФото: ${updated.photo_url}`,
+    { reply_markup: restartInlineKeyboard() }
+  );
+
+  resetItemState(userId);
+}
+
+const docPromise = initDoc();
 
 // ---- Telegram bot init ----
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 // ---- /start and /reset ----
 bot.onText(/\/start/, async (msg) => {
-  await beginForm(msg.chat.id, msg.from.id);
+  await beginFlow(msg.chat.id, msg.from.id);
 });
 
 bot.onText(/\/reset/, async (msg) => {
   sessions.delete(msg.from.id);
-  await bot.sendMessage(msg.chat.id, "Анкета сброшена. Нажмите «🚀 Старт» или напишите /start.", {
+  await bot.sendMessage(msg.chat.id, "Сессия сброшена. Нажмите «🚀 Старт» или напишите /start.", {
     reply_markup: mainMenuKeyboard(),
   });
 });
 
-// ---- inline callbacks (consent / telegram confirm / restart) ----
+bot.onText(/^\/stats(?:@\w+)?$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  if (ADMIN_USER_IDS.size === 0) {
+    await bot.sendMessage(chatId, "Команда /stats не настроена. Добавьте ADMIN_USER_IDS в .env.");
+    return;
+  }
+
+  if (!isAdmin(userId)) {
+    await bot.sendMessage(chatId, "⛔️ У вас нет доступа к админ-статистике.");
+    return;
+  }
+
+  try {
+    const { counts, total } = await buildStats();
+    const text =
+      "📊 Статистика гардероба\n\n" +
+      `Верх: ${counts.верх || 0}\n` +
+      `Тело: ${counts.тело || 0}\n` +
+      `Низ: ${counts.низ || 0}\n\n` +
+      `Итого: ${total}`;
+
+    await bot.sendMessage(chatId, text);
+  } catch (err) {
+    console.error("STATS ERROR:", err);
+    await bot.sendMessage(chatId, "❌ Не удалось получить статистику. Попробуйте позже.");
+  }
+});
+
+// ---- inline callbacks ----
 bot.on("callback_query", async (q) => {
   const userId = q.from.id;
   const chatId = q.message.chat.id;
-  const messageId = q.message.message_id;
+  const data = q.data || "";
 
   const s = getSession(userId);
   if (!s) {
@@ -251,140 +463,241 @@ bot.on("callback_query", async (q) => {
     return;
   }
 
-  // согласие
-  if (q.data === "consent_toggle") {
-    const newValue = !s.consent;
-    setSession(userId, { consent: newValue, consent_at: newValue ? nowIso() : null });
-
-    await bot.editMessageReplyMarkup(consentKeyboard(newValue), {
-      chat_id: chatId,
-      message_id: messageId,
-    });
-
-    await bot.answerCallbackQuery(q.id, { text: newValue ? "Согласие принято" : "Согласие снято" });
+  if (!s.authenticated) {
+    await bot.answerCallbackQuery(q.id, { text: "Сначала введите пароль", show_alert: true });
     return;
   }
 
-  if (q.data === "consent_continue") {
-    if (!s.consent) {
-      await bot.answerCallbackQuery(q.id, { text: "Нужно поставить галочку согласия.", show_alert: true });
+  try {
+    if (data === "restart_form") {
+      resetItemState(userId);
+      await bot.sendMessage(chatId, "Отправьте следующую вещь (как фото, не как файл):");
+      await bot.answerCallbackQuery(q.id);
       return;
     }
 
-    setSession(userId, { step: "full_name" });
-    await bot.sendMessage(chatId, "Введите ФИО в формате: Фамилия Имя Отчество (3 слова).\nПример: Иванов Иван Иванович");
-    await bot.answerCallbackQuery(q.id);
-    return;
-  }
-
-  // подтверждение Telegram
-  if (q.data === "tg_confirm_yes") {
-    if (!s.suggested_tg) {
-      setSession(userId, { step: "telegram" });
-      await bot.sendMessage(chatId, "Не удалось определить username. Введите Telegram вручную: @username или t.me/username");
-      await bot.answerCallbackQuery(q.id, { text: "Введите вручную" });
+    if (data === "cat_main_upper") {
+      setSession(userId, { step: "upper_season", main_category: "верх", sub_categories: [] });
+      await bot.sendMessage(chatId, "Выберите категорию для верха:", { reply_markup: upperSeasonKeyboard() });
+      await bot.answerCallbackQuery(q.id);
       return;
     }
 
-    setSession(userId, { telegram: s.suggested_tg, step: "photo" });
-    await bot.sendMessage(chatId, "Отправьте вашу фотографию (как фото, не как файл):");
-    await bot.answerCallbackQuery(q.id, { text: "Telegram подтверждён" });
-    return;
-  }
+    if (data === "cat_main_body") {
+      setSession(userId, { step: "body_warmth", main_category: "тело", sub_categories: [] });
+      await bot.sendMessage(chatId, "Выберите тип вещи для тела:", { reply_markup: bodyWarmthKeyboard() });
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
 
-  if (q.data === "tg_confirm_other") {
-    setSession(userId, { step: "telegram" });
-    await bot.sendMessage(chatId, "Ок! Введите Telegram username в формате @username (или ссылку t.me/username):");
+    if (data === "cat_main_lower") {
+      setSession(userId, { step: "lower_type", main_category: "низ", sub_categories: [] });
+      await bot.sendMessage(chatId, "Выберите: штаны или обувь:", { reply_markup: lowerTypeKeyboard() });
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_upper_summer") {
+      await finalizeCategory(chatId, userId, "верх", ["головной убор", "летний"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_upper_winter") {
+      await finalizeCategory(chatId, userId, "верх", ["головной убор", "зимний"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_upper_midseason") {
+      await finalizeCategory(chatId, userId, "верх", ["головной убор", "осенне-весенний"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_body_light") {
+      setSession(userId, { step: "body_light_type", main_category: "тело", sub_categories: ["легкая вещь"] });
+      await bot.sendMessage(chatId, "Выберите категорию легкой вещи:", { reply_markup: bodyLightTypeKeyboard() });
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_body_warm") {
+      setSession(userId, { step: "body_warm_type", main_category: "тело", sub_categories: ["теплая вещь"] });
+      await bot.sendMessage(chatId, "Выберите категорию теплой вещи:", { reply_markup: bodyWarmTypeKeyboard() });
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_body_light_tshirt") {
+      await finalizeCategory(chatId, userId, "тело", ["легкая вещь", "футболка"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_body_light_sweater") {
+      await finalizeCategory(chatId, userId, "тело", ["легкая вещь", "кофта"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_body_light_shirt") {
+      await finalizeCategory(chatId, userId, "тело", ["легкая вещь", "рубашка"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_body_light_jacket") {
+      await finalizeCategory(chatId, userId, "тело", ["легкая вещь", "легкая куртка"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_body_warm_winter_jacket") {
+      await finalizeCategory(chatId, userId, "тело", ["теплая вещь", "куртка зимняя"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_body_warm_light_jacket") {
+      await finalizeCategory(chatId, userId, "тело", ["теплая вещь", "куртка легкая"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_body_warm_sweater") {
+      await finalizeCategory(chatId, userId, "тело", ["теплая вещь", "теплая кофта"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_lower_pants") {
+      setSession(userId, { step: "pants_length", main_category: "низ", sub_categories: ["штаны"] });
+      await bot.sendMessage(chatId, "Выберите длину штанов:", { reply_markup: pantsLengthKeyboard() });
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_lower_shoes") {
+      setSession(userId, { step: "shoes_type", main_category: "низ", sub_categories: ["обувь"] });
+      await bot.sendMessage(chatId, "Выберите тип обуви:", { reply_markup: shoesTypeKeyboard() });
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_pants_short") {
+      setSession(userId, { step: "pants_short_type", main_category: "низ", sub_categories: ["штаны", "короткие штаны"] });
+      await bot.sendMessage(chatId, "Выберите категорию коротких штанов:", { reply_markup: shortPantsTypeKeyboard() });
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_pants_long") {
+      setSession(userId, { step: "pants_long_type", main_category: "низ", sub_categories: ["штаны", "длинные штаны"] });
+      await bot.sendMessage(chatId, "Выберите категорию длинных штанов:", { reply_markup: longPantsTypeKeyboard() });
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_pants_short_sport") {
+      await finalizeCategory(chatId, userId, "низ", ["штаны", "короткие штаны", "шорты для спорта"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_pants_short_swim") {
+      await finalizeCategory(chatId, userId, "низ", ["штаны", "короткие штаны", "шорты для плавания"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_pants_short_walk") {
+      await finalizeCategory(chatId, userId, "низ", ["штаны", "короткие штаны", "шорты для прогулок"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_pants_long_sport") {
+      await finalizeCategory(chatId, userId, "низ", ["штаны", "длинные штаны", "штаны для спорта"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_pants_long_jeans") {
+      await finalizeCategory(chatId, userId, "низ", ["штаны", "длинные штаны", "джинсы"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_pants_long_walk") {
+      await finalizeCategory(chatId, userId, "низ", ["штаны", "длинные штаны", "штаны для прогулок"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_pants_long_warm") {
+      await finalizeCategory(chatId, userId, "низ", ["штаны", "длинные штаны", "теплые штаны"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
+    if (data === "cat_shoes_winter") {
+      await finalizeCategory(chatId, userId, "низ", ["обувь", "зимняя обувь"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_shoes_sport") {
+      await finalizeCategory(chatId, userId, "низ", ["обувь", "спортивная обувь"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_shoes_light") {
+      await finalizeCategory(chatId, userId, "низ", ["обувь", "легкая обувь"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_shoes_crocs") {
+      await finalizeCategory(chatId, userId, "низ", ["обувь", "кроксы"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+    if (data === "cat_shoes_slippers") {
+      await finalizeCategory(chatId, userId, "низ", ["обувь", "тапочки"]);
+      await bot.answerCallbackQuery(q.id);
+      return;
+    }
+
     await bot.answerCallbackQuery(q.id);
-    return;
+  } catch (err) {
+    console.error("CALLBACK ERROR:", err);
+    await bot.answerCallbackQuery(q.id, { text: "Ошибка при обработке выбора", show_alert: true });
+    await bot.sendMessage(chatId, "❌ Не удалось сохранить категорию. Попробуйте выбрать снова.");
   }
-
-  // заполнить заново
-  if (q.data === "restart_form") {
-    await bot.answerCallbackQuery(q.id);
-    await beginForm(chatId, userId);
-    return;
-  }
-
-  await bot.answerCallbackQuery(q.id);
 });
 
-// ---- messages (шаги анкеты + кнопки меню) ----
+// ---- messages ----
 bot.on("message", async (msg) => {
-  // игнорируем команды
   if (msg.text && msg.text.startsWith("/")) return;
 
   const userId = msg.from.id;
   const chatId = msg.chat.id;
   const txt = (msg.text || "").trim();
 
-  // кнопки меню (reply keyboard)
   if (txt === "🚀 Старт" || txt === "🔄 Начать заново") {
-    await beginForm(chatId, userId);
+    await beginFlow(chatId, userId);
     return;
   }
 
   const s = getSession(userId);
-  if (!s) return; // пользователь не начинал
+  if (!s) return;
 
-  // шаг: full_name (ровно 3 слова)
-  if (s.step === "full_name") {
-    const fullNameRaw = String(msg.text || "").trim();
-    const parts = fullNameRaw.split(/\s+/).filter(Boolean);
-
-    if (parts.length !== 3) {
-      await bot.sendMessage(
-        chatId,
-        "Пожалуйста, введите ФИО в формате: Фамилия Имя Отчество (3 слова).\nПример: Иванов Иван Иванович"
-      );
+  if (s.step === "password") {
+    if (txt !== ACCESS_PASSWORD) {
+      await bot.sendMessage(chatId, "Неверный пароль. Попробуйте еще раз.");
       return;
     }
 
-    const fullName = parts.join(" ");
-    setSession(userId, { full_name: fullName, step: "phone" });
-    await bot.sendMessage(chatId, "Введите телефон в формате +79991234567 (или 79991234567):");
+    setSession(userId, { authenticated: true });
+    resetItemState(userId);
+    await bot.sendMessage(chatId, "Пароль верный ✅\nТеперь отправьте фото вещи (как фото, не как файл).");
     return;
   }
 
-  // шаг: phone
-  if (s.step === "phone") {
-    const phone = normalizePhone(msg.text);
-    if (!phone) {
-      await bot.sendMessage(chatId, "Не похоже на номер. Пример: +79991234567");
-      return;
-    }
-
-    const username = msg.from.username ? `@${msg.from.username}` : null;
-    setSession(userId, {
-      phone,
-      step: "telegram",
-      suggested_tg: username,
-    });
-
-    if (username) {
-      await bot.sendMessage(chatId, `Я нашёл ваш Telegram: ${username}\nПодтвердите, пожалуйста:`, {
-        reply_markup: telegramConfirmKeyboard(username),
-      });
-    } else {
-      await bot.sendMessage(chatId, "Введите ваш Telegram username в формате @username (или ссылку t.me/username):");
-    }
+  if (!s.authenticated) {
+    await bot.sendMessage(chatId, "Сначала введите пароль.");
     return;
   }
 
-  // шаг: telegram (ручной ввод)
-  if (s.step === "telegram") {
-    const tg = normalizeTg(msg.text);
-    if (!tg) {
-      await bot.sendMessage(chatId, "Не удалось распознать username. Пример: @username или t.me/username");
-      return;
-    }
-
-    setSession(userId, { telegram: tg, step: "photo" });
-    await bot.sendMessage(chatId, "Отправьте вашу фотографию (как фото, не как файл):");
-    return;
-  }
-
-  // шаг: photo
   if (s.step === "photo") {
     const photos = msg.photo;
     if (!photos || photos.length === 0) {
@@ -396,58 +709,46 @@ bot.on("message", async (msg) => {
     const photoFileId = biggest.file_id;
 
     try {
-      // 1) file_path
       const fileInfo = await bot.getFile(photoFileId);
-      const filePath = fileInfo.file_path; // e.g. photos/file_123.jpg
-
-      // 2) Telegram download url
+      const filePath = fileInfo.file_path;
       const tgDownloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
 
-      // 3) filename on server
       const ext = path.extname(filePath) || ".jpg";
       const fileName = safeFileName(`${userId}_${Date.now()}${ext}`);
-
-      // 4) save to uploads/
       const localPath = path.join(uploadsAbsPath, fileName);
       await downloadToFile(tgDownloadUrl, localPath);
 
-      // 5) public url
       const photoUrl = `${PUBLIC_BASE_URL}/uploads/${encodeURIComponent(fileName)}`;
-
-      // 6) write to Google Sheet
-      const sheet = await sheetPromise;
-
-      const row = {
-        created_at: nowIso(),
-        user_id: String(userId),
-        full_name: s.full_name,
-        phone: s.phone,
-        telegram: s.telegram,
-        consent: s.consent ? "yes" : "no",
-        consent_at: s.consent_at || "",
+      setSession(userId, {
+        step: "main_category",
         photo_file_id: photoFileId,
         photo_url: photoUrl,
-      };
+      });
 
-      await sheet.addRow(row);
-
-      await bot.sendMessage(
-        chatId,
-        "✅ Регистрация завершена!\n\n" +
-          "Вы зарегистрированы как участник.\n\n" +
-          "📞 В ближайшее время с вами свяжется организатор.\n" +
-          "Пожалуйста, ожидайте сообщения.",
-        {
-          reply_markup: restartInlineKeyboard(),
-        }
-      );
-
-      sessions.delete(userId);
+      await bot.sendMessage(chatId, "Фото загружено ✅");
+      await askForMainCategory(chatId);
       return;
     } catch (err) {
       console.error("PHOTO SAVE ERROR:", err);
-      await bot.sendMessage(chatId, "❌ Не удалось сохранить фото. Попробуйте отправить фото ещё раз.");
+      await bot.sendMessage(chatId, "❌ Не удалось сохранить фото. Попробуйте отправить фото еще раз.");
       return;
     }
+  }
+
+  const stepsWithButtons = new Set([
+    "main_category",
+    "upper_season",
+    "body_warmth",
+    "body_light_type",
+    "body_warm_type",
+    "lower_type",
+    "pants_length",
+    "pants_short_type",
+    "pants_long_type",
+    "shoes_type",
+  ]);
+
+  if (stepsWithButtons.has(s.step)) {
+    await bot.sendMessage(chatId, "Выберите вариант с помощью кнопок ниже.");
   }
 });
