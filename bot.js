@@ -16,12 +16,6 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_CREDS = process.env.GOOGLE_CREDS || "service_account.json";
 const ACCESS_PASSWORD = process.env.BOT_PASSWORD || "shkaf2026";
-const ADMIN_USER_IDS = new Set(
-  String(process.env.ADMIN_USER_IDS || "")
-    .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean)
-);
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 3000);
@@ -60,10 +54,6 @@ function safeFileName(s) {
   return String(s).replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-function isAdmin(userId) {
-  return ADMIN_USER_IDS.has(String(userId));
-}
-
 function downloadToFile(url, destPath) {
   return new Promise((resolve, reject) => {
     https
@@ -100,9 +90,9 @@ const MAIN_CATEGORY_TO_SHEET = {
 };
 
 // ---- keyboards ----
-function mainMenuKeyboard(userId) {
+function mainMenuKeyboard(showStats = false) {
   const row = [{ text: "🚀 Старт" }, { text: "🔄 Начать заново" }];
-  if (isAdmin(userId)) {
+  if (showStats) {
     row.push({ text: "📊 Статистика" });
   }
 
@@ -265,7 +255,7 @@ async function beginFlow(chatId, userId) {
   });
 
   await bot.sendMessage(chatId, "Выберите действие:", {
-    reply_markup: mainMenuKeyboard(userId),
+    reply_markup: mainMenuKeyboard(false),
   });
   await bot.sendMessage(chatId, "Введите пароль для доступа к персональному гардеробу:");
 }
@@ -369,13 +359,9 @@ async function buildStats() {
 }
 
 async function handleStatsRequest(chatId, userId) {
-  if (ADMIN_USER_IDS.size === 0) {
-    await bot.sendMessage(chatId, "Команда /stats не настроена. Добавьте ADMIN_USER_IDS в .env.");
-    return;
-  }
-
-  if (!isAdmin(userId)) {
-    await bot.sendMessage(chatId, "⛔️ У вас нет доступа к админ-статистике.");
+  const s = getSession(userId);
+  if (!s || !s.authenticated) {
+    await bot.sendMessage(chatId, "Сначала нажмите «🚀 Старт» и введите пароль.");
     return;
   }
 
@@ -450,7 +436,7 @@ bot.onText(/\/start/, async (msg) => {
 bot.onText(/\/reset/, async (msg) => {
   sessions.delete(msg.from.id);
   await bot.sendMessage(msg.chat.id, "Сессия сброшена. Нажмите «🚀 Старт» или напишите /start.", {
-    reply_markup: mainMenuKeyboard(msg.from.id),
+    reply_markup: mainMenuKeyboard(false),
   });
 });
 
@@ -700,7 +686,9 @@ bot.on("message", async (msg) => {
 
     setSession(userId, { authenticated: true });
     resetItemState(userId);
-    await bot.sendMessage(chatId, "Пароль верный ✅\nТеперь отправьте фото вещи (как фото, не как файл).");
+    await bot.sendMessage(chatId, "Пароль верный ✅\nТеперь отправьте фото вещи (как фото, не как файл).", {
+      reply_markup: mainMenuKeyboard(true),
+    });
     return;
   }
 
